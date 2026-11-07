@@ -16,6 +16,20 @@ import (
 	"github.com/yetone/magpie/internal/probelog"
 )
 
+type backgroundListKey struct{}
+
+// WithBackgroundList marks a list fetch that magpie makes on its own
+// schedule (KeepListsFresh, a Remote magpie's list followed): the models
+// are refreshed, but nothing that costs a generation is verified.
+func WithBackgroundList(ctx context.Context) context.Context {
+	return context.WithValue(ctx, backgroundListKey{}, true)
+}
+
+func backgroundList(ctx context.Context) bool {
+	on, _ := ctx.Value(backgroundListKey{}).(bool)
+	return on
+}
+
 // inferredEndpoint derives only the standard sibling on the same origin and
 // deployment prefix. Independent endpoints and nonstandard paths stay as set.
 func (p Provider) inferredEndpoint(target Protocol) (Provider, bool) {
@@ -69,8 +83,21 @@ func (p Provider) inferredEndpoint(target Protocol) (Provider, bool) {
 // declaration and falling back to the originally configured APIs. Successful
 // sibling endpoints are added, never substituted for the user's URL/BaseAPI.
 // The shared generation budget and total deadline bound a large model list.
+//
+// Only a model whose own list entry declares an API is verified: a vendor
+// that says nothing about a model has not asked for the repair, and paying a
+// generation for every model of every list refresh is not magpie's to spend
+// (OpenRouter lists hundreds with no per-model declaration, and a fetch asks
+// several URLs already). A background refresh (KeepListsFresh) verifies
+// nothing either: its answer is already known from the last one, and a list
+// tick is not the user asking.
 func (p Provider) correctNative(ctx context.Context, ms []catalog.Model) error {
 	if p.Account != nil || p.Preset != "" || p.Decide != "" || len(p.Keys) > 0 || p.KeyProtocol != "" || p.NativeCompaction || p.ServesNone() || p.Off {
+		return nil
+	}
+	// A provider given a list URL of its own is listed where its user said,
+	// and its bases are not asked anything beyond it.
+	if p.ModelsURL != "" || backgroundList(ctx) {
 		return nil
 	}
 	f, err := read()
@@ -121,6 +148,11 @@ func (p Provider) correctNative(ctx context.Context, ms []catalog.Model) error {
 		if !listedHere {
 			continue
 		}
+		// No declaration, no repair: the list said nothing about this model,
+		// so there is nothing to reconcile and nothing to pay for.
+		if len(m.APIs) == 0 {
+			continue
+		}
 		manualMatch, inferredDeclaration := false, false
 		for _, api := range m.APIs {
 			proto := Protocol(api)
@@ -149,9 +181,6 @@ func (p Provider) correctNative(ctx context.Context, ms []catalog.Model) error {
 			}
 			view := q.WithKey(key)
 			if v, ok := view.learned(model); ok && time.Now().Before(v.Until) {
-				continue
-			}
-			if len(m.APIs) == 0 && len(p.WithKey(key).Speaks()) < 2 {
 				continue
 			}
 			var candidates []Protocol

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
@@ -37,19 +38,71 @@ var learnedAPIs = struct {
 	unreadable map[string]bool
 }{entries: make(map[[32]byte]learnedAPI), scopes: make(map[string]bool), loaded: make(map[string]bool), unreadable: make(map[string]bool)}
 
+// learnedCount and learnedReady are read for every model of every list: a
+// magpie that has verified nothing answers from these two words alone, with
+// no path joined, no lock taken and nothing allocated. The count is the
+// successes in memory; ready says the file was read once.
+var learnedCount atomic.Int64
+var learnedReady atomic.Bool
+
 // Disk work is serialized outside the cache lock its readers need.
 var learnedAPIIO sync.Mutex
 
+// learnedPath is the file the successes are kept in, once per configuration
+// folder: the path is joined on every look at it, and a look at it is every
+// model of every list.
+var learnedPath struct {
+	sync.Mutex
+	by map[string]string
+}
+
 func learnedAPIPath() string {
-	return filepath.Join(filepath.Dir(Path()), "native-api-cache.json")
+	dir := learnedConfigDir()
+	learnedPath.Lock()
+	defer learnedPath.Unlock()
+	if learnedPath.by == nil {
+		learnedPath.by = map[string]string{}
+	}
+	if p, ok := learnedPath.by[dir]; ok {
+		return p
+	}
+	p := filepath.Join(dir, "native-api-cache.json")
+	learnedPath.by[dir] = p
+	return p
+}
+
+// learnedConfigDir is the folder magpie keeps its files in, once per path:
+// every model of every list asks for it.
+var learnedDir struct {
+	sync.Mutex
+	by map[string]string
+}
+
+func learnedConfigDir() string {
+	path := Path()
+	learnedDir.Lock()
+	defer learnedDir.Unlock()
+	if learnedDir.by == nil {
+		learnedDir.by = map[string]string{}
+	}
+	if d, ok := learnedDir.by[path]; ok {
+		return d
+	}
+	d := filepath.Dir(path)
+	learnedDir.by[path] = d
+	return d
 }
 
 func loadLearnedAPIs() {
+	if learnedReady.Load() {
+		return
+	}
 	path := learnedAPIPath()
 	learnedAPIs.Lock()
 	loaded := learnedAPIs.loaded[path]
 	learnedAPIs.Unlock()
 	if loaded {
+		learnedReady.Store(true)
 		return
 	}
 	learnedAPIIO.Lock()
@@ -71,6 +124,7 @@ func loadLearnedAPIs() {
 	defer learnedAPIs.Unlock()
 	learnedAPIs.loaded[path] = true
 	learnedAPIs.unreadable[path] = unreadable
+	learnedReady.Store(true)
 	if err != nil {
 		return
 	}
@@ -86,8 +140,9 @@ func loadLearnedAPIs() {
 		copy(k[:], b)
 		v.file = path
 		learnedAPIs.entries[k] = v
-		learnedAPIs.scopes[Path()+"\x00"+v.Provider] = true
+		learnedAPIs.scopes[v.Provider] = true
 	}
+	learnedCount.Store(int64(len(learnedAPIs.entries)))
 }
 
 func persistLearnedAPIs() {
@@ -173,11 +228,7 @@ func (p Provider) learningKey(model string) ([32]byte, bool) {
 
 func (p Provider) learned(model string) (learnedAPI, bool) {
 	loadLearnedAPIs()
-	scope := Path() + "\x00" + p.ID
-	learnedAPIs.Lock()
-	has := learnedAPIs.scopes[scope]
-	learnedAPIs.Unlock()
-	if !has {
+	if !p.hasEvidence() {
 		return learnedAPI{}, false
 	}
 	key, ok := p.learningKey(model)
@@ -194,6 +245,20 @@ func (p Provider) learned(model string) (learnedAPI, bool) {
 	}
 	learnedAPIs.Unlock()
 	return v, ok
+}
+
+// hasEvidence is whether this provider may have any remembered success at
+// all: a magpie that has verified nothing answers before a path is joined or
+// a lock is taken, and a provider with nothing in memory pays one scope
+// look-up for each of its models.
+func (p Provider) hasEvidence() bool {
+	if learnedCount.Load() == 0 {
+		return false
+	}
+	learnedAPIs.Lock()
+	has := learnedAPIs.scopes[p.ID]
+	learnedAPIs.Unlock()
+	return has
 }
 
 // LearnedAPI returns this model's successful API for these effective endpoints
@@ -213,11 +278,7 @@ func (p Provider) LearnedAPIReader() func(string) (Protocol, bool) {
 		return noLearnedAPI
 	}
 	loadLearnedAPIs()
-	scope := Path() + "\x00" + p.ID
-	learnedAPIs.Lock()
-	has := learnedAPIs.scopes[scope]
-	learnedAPIs.Unlock()
-	if !has {
+	if !p.hasEvidence() {
 		return noLearnedAPI
 	}
 	f, ok := p.learningFingerprint()
@@ -264,7 +325,7 @@ func (p Provider) rememberLearning(model string, proto Protocol, ttl time.Durati
 	if !ok {
 		return false
 	}
-	scope := Path() + "\x00" + p.ID
+	scope := p.ID
 	learnedAPIs.Lock()
 	now := time.Now()
 	old, had := learnedAPIs.entries[key]
@@ -295,12 +356,17 @@ func (p Provider) rememberLearning(model string, proto Protocol, ttl time.Durati
 		proto = old.Protocol
 	}
 	learnedAPIs.entries[key] = learnedAPI{Protocol: proto, Until: now.Add(ttl), Provider: p.ID, file: learnedAPIPath()}
+	learnedCount.Store(int64(len(learnedAPIs.entries)))
 	learnedAPIs.Unlock()
 	if changed {
 		Changed()
 		catalog.Touched()
 	}
-	if changed && proto != "" {
+	// A success is written to the file when it is new or its protocol
+	// changed: that is what carries it over a restart. A renewal of the same
+	// success only moves its deadline in memory, so a list that keeps
+	// answering does not write the file on every refresh.
+	if proto != "" && (!had || old.Protocol != proto) {
 		persistLearnedAPIs()
 	}
 	return true

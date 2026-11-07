@@ -326,7 +326,7 @@ func refreshDueLists(ctx context.Context, now time.Time) []string {
 			return asked
 		}
 		asked = append(asked, p.ID)
-		fctx, cancel := context.WithTimeout(ctx, time.Minute)
+		fctx, cancel := context.WithTimeout(WithBackgroundList(ctx), time.Minute)
 		ms, dropped, taken, err := p.RefetchTaking(fctx)
 		cancel()
 		switch {

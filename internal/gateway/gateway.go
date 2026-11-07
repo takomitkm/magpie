@@ -7402,6 +7402,18 @@ func (s *Server) markUnfit(providerID, model string, proto provider.Protocol) {
 // Messages API is served, which alone keeps its cache_control and
 // thinking (#997).
 func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
+	return s.usableAmong(p, model, true)
+}
+
+// usableDeclared is usable without what a generation taught magpie: the
+// order the provider's own list and its maker's preference give. A choice
+// that needs the model's declared capability (a searcher's own tool) reads
+// this, so a protocol learned from a reply cannot move it.
+func (s *Server) usableDeclared(p provider.Provider, model string) []provider.Protocol {
+	return s.usableAmong(p, model, false)
+}
+
+func (s *Server) usableAmong(p provider.Provider, model string, learned bool) []provider.Protocol {
 	apis := p.ListedAPIs(model)
 	if explicit, ok := p.ModelAPI(model); ok {
 		apis = []provider.Protocol{explicit}
@@ -7418,11 +7430,11 @@ func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
 	if p.MessagesFirst(model) {
 		sort.SliceStable(out, func(i, j int) bool { return out[i] == provider.Anthropic && out[j] != provider.Anthropic })
 	}
-	if _, explicit := p.ModelAPI(model); !explicit {
-		if learned, ok := p.LearnedAPI(model); ok && s.fits(p.ID, model, learned) && slices.Contains(p.Speaks(), learned) {
+	if _, explicit := p.ModelAPI(model); !explicit && learned {
+		if pr, ok := p.LearnedAPI(model); ok && s.fits(p.ID, model, pr) && slices.Contains(p.Speaks(), pr) {
 			// Actual success overrides catalog declarations, but remains a
 			// preference: the other declared protocols remain available.
-			out = append([]provider.Protocol{learned}, slices.DeleteFunc(out, func(proto provider.Protocol) bool { return proto == learned })...)
+			out = append([]provider.Protocol{pr}, slices.DeleteFunc(out, func(proto provider.Protocol) bool { return proto == pr })...)
 		}
 	}
 	return out
@@ -8548,8 +8560,11 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 		// without one, its model is given magpie's search. A searcher
 		// asked for another model goes there too: on its first API
 		// (DeepSeek's Chat) it had no search tool and answered from
-		// nothing (#669)
-		for _, t := range s.usable(p, model) {
+		// nothing (#669). A protocol learned from a generation is no
+		// reason to ask the searcher there: what a searcher needs is its
+		// own tool, which the list's declaration is about, not what
+		// answered last.
+		for _, t := range s.usableDeclared(p, model) {
 			if searchesFor(p, t, model, request) && !magpieSearches(r.Context(), p) {
 				if from == provider.Responses && (to == provider.Responses) != (t == provider.Responses) {
 					request, err = parseRequest(from, body, false, t == provider.Responses)

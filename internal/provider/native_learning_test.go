@@ -148,12 +148,17 @@ func TestNativeLearningInferredEndpointNeedsEachModelsEvidence(t *testing.T) {
 	}
 }
 
-func TestNativeLearningUnknownModelsHaveSharedBudget(t *testing.T) {
+// A list with more declared models than one fetch may verify verifies the
+// first 24 and leaves the rest unknown, not unsupported. Models the list
+// says nothing about are never verified: a vendor that lists hundreds
+// without a per-model declaration (OpenRouter's) would otherwise pay a
+// generation for each on every refresh.
+func TestNativeLearningDeclaredModelsHaveSharedBudget(t *testing.T) {
 	detectHome(t)
 	var posts atomic.Int32
 	var models []string
 	for i := 0; i < 40; i++ {
-		models = append(models, fmt.Sprintf(`{"id":"model-%d"}`, i))
+		models = append(models, fmt.Sprintf(`{"id":"model-%d","native_endpoints":["/v1/messages"]}`, i))
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
@@ -161,7 +166,7 @@ func TestNativeLearningUnknownModelsHaveSharedBudget(t *testing.T) {
 			return
 		}
 		posts.Add(1)
-		io.WriteString(w, `{"choices":[{"message":{"content":"OK"}}]}`)
+		io.WriteString(w, nativeMessagesAnswer)
 	}))
 	defer srv.Close()
 	p := Provider{ID: "relay", Name: "Relay", Key: "fake", Chat: srv.URL + "/v1", Responses: srv.URL + "/v1", BaseAPI: "chat"}
@@ -178,6 +183,98 @@ func TestNativeLearningUnknownModelsHaveSharedBudget(t *testing.T) {
 	q := mustNativeProvider(t, p.ID)
 	if _, ok := q.LearnedAPI("model-24"); ok {
 		t.Fatal("an unprobed model gained success evidence")
+	}
+}
+
+// A list that says nothing about its models is refreshed without a
+// generation request, however many endpoints the provider has.
+func TestNativeLearningUndeclaredModelsCostNoGeneration(t *testing.T) {
+	detectHome(t)
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			io.WriteString(w, `{"data":[{"id":"a"},{"id":"b"}]}`)
+			return
+		}
+		posts.Add(1)
+		io.WriteString(w, nativeMessagesAnswer)
+	}))
+	defer srv.Close()
+	p := Provider{ID: "relay", Name: "Relay", Key: "fake", Chat: srv.URL + "/v1", Responses: srv.URL + "/v1", Anthropic: srv.URL, BaseAPI: "chat"}
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	p = mustNativeProvider(t, p.ID)
+	if _, err := p.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if posts.Load() != 0 {
+		t.Fatalf("a list with no declaration paid %d generations", posts.Load())
+	}
+}
+
+// A provider whose list comes from a URL the user gave is listed there and
+// nowhere else, and nothing of it is generated for.
+func TestNativeLearningListURLAloneIsAsked(t *testing.T) {
+	detectHome(t)
+	var lists, posts atomic.Int32
+	list := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lists.Add(1)
+		io.WriteString(w, `{"data":[{"id":"only","native_endpoints":["/v1/messages"]}]}`)
+	}))
+	defer list.Close()
+	base := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		io.WriteString(w, nativeMessagesAnswer)
+	}))
+	defer base.Close()
+	p := Provider{ID: "listed", Name: "Listed", Key: "fake", Chat: base.URL + "/v1", Anthropic: base.URL, BaseAPI: "chat", ModelsURL: list.URL + "/v1/models"}
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	q, err := Find(p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if lists.Load() != 1 || posts.Load() != 0 {
+		t.Fatalf("asked its list %d times and a base %d times", lists.Load(), posts.Load())
+	}
+}
+
+// A refresh magpie schedules itself takes what the last one learned without
+// paying again: only a fetch the user asked for verifies.
+func TestNativeLearningScheduledRefreshPaysNoGeneration(t *testing.T) {
+	detectHome(t)
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			io.WriteString(w, nativeMessagesList)
+			return
+		}
+		posts.Add(1)
+		io.WriteString(w, nativeMessagesAnswer)
+	}))
+	defer srv.Close()
+	p := Provider{ID: "relay", Name: "Relay", Key: "fake", Chat: srv.URL + "/v1", BaseAPI: "chat", Models: []string{"zcode/GLM-5.3-Flash"}}
+	if err := Save(p); err != nil {
+		t.Fatal(err)
+	}
+	p = mustNativeProvider(t, p.ID)
+	if _, err := p.Fetch(WithBackgroundList(context.Background())); err != nil {
+		t.Fatal(err)
+	}
+	if posts.Load() != 0 {
+		t.Fatalf("a scheduled refresh paid %d generations", posts.Load())
+	}
+	// and the user's own Fetch still repairs the provider
+	if _, err := p.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if posts.Load() == 0 {
+		t.Fatal("a fetch the user asked for verified nothing")
 	}
 }
 
@@ -302,6 +399,8 @@ func TestNativeLearningKeepsMultipleAndProtocolBoundKeys(t *testing.T) {
 	}
 }
 
+// forgetLearningMemory is a restart: nothing of what this process learned is
+// in memory any more, and the file is read again as a new magpie reads it.
 func forgetLearningMemory() {
 	learnedAPIs.Lock()
 	clear(learnedAPIs.entries)
@@ -309,6 +408,8 @@ func forgetLearningMemory() {
 	clear(learnedAPIs.loaded)
 	clear(learnedAPIs.unreadable)
 	learnedAPIs.Unlock()
+	learnedReady.Store(false)
+	learnedCount.Store(0)
 }
 
 func TestNativeLearningSingleManualUnknownAPIIsNative(t *testing.T) {

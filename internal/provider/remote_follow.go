@@ -173,7 +173,7 @@ func followList(ctx context.Context, id string) {
 		}
 		failWait = followFailWait
 		if now != tag {
-			fctx, cancel := context.WithTimeout(ctx, time.Minute)
+			fctx, cancel := context.WithTimeout(WithBackgroundList(ctx), time.Minute)
 			ms, dropped, taken, err := p.RefetchTaking(fctx)
 			cancel()
 			if err != nil {

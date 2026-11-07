@@ -18,13 +18,43 @@ func NativeEndpoints(e Entry) []string {
 	return endpointsOf(relayed(e.Provider, e.Model))
 }
 
-// relayed are the APIs p takes a request for model on as it is, in the
-// order p speaks them: none for a model every request to is translated
-// anyway.
+// relayed are the APIs p advertises for one model as its own: what the
+// vendor's list says it is served on, and only that. A multi-protocol
+// provider whose list says nothing about a model advertises none of them:
+// saying every one of them is what served #5022.
 func relayed(p Provider, model string) []Protocol {
 	if p.Native(model) == "" {
 		return nil
 	}
+	return nativeAdvertised(p, model)
+}
+
+// groupServed are the APIs p takes a request for model on as it is, for a
+// routing group: what the vendor's list says where it says anything, else the
+// APIs p is configured for. A group's members may be any of them, and a
+// member whose list says nothing is not one the group can rule out: a group
+// of relays whose lists carry no per-model declaration was asked on Chat,
+// where the member best on Responses was translated instead of relayed
+// (#1594).
+func groupServed(p Provider, model string) []Protocol {
+	if p.Native(model) == "" {
+		return nil
+	}
+	if apis := p.APIs(model); apis != nil {
+		return nativeAdvertised(p, model)
+	}
+	var out []Protocol
+	for _, pr := range p.Speaks() {
+		if slices.Contains(Protocols, pr) {
+			out = append(out, pr)
+		}
+	}
+	return out
+}
+
+// nativeAdvertised is the APIs p speaks that it also serves model on, as its
+// list says.
+func nativeAdvertised(p Provider, model string) []Protocol {
 	apis := p.APIs(model)
 	speaks := p.Speaks()
 	if apis == nil && p.Account == nil && p.Preset == "" && (len(speaks) > 1 || slices.ContainsFunc(speaks, p.inferredAPI)) {
@@ -54,7 +84,7 @@ func endpointsOf(prs []Protocol) []string {
 func GroupEndpoints(ms []Member) []string {
 	var common []Protocol
 	for i, m := range ms {
-		r := relayed(m.Provider, m.Model)
+		r := groupServed(m.Provider, m.Model)
 		if i == 0 {
 			common = r
 			continue
@@ -85,7 +115,7 @@ func GroupAPI(ms []Member) Protocol {
 		if n == "" {
 			continue
 		}
-		if !slices.Contains(relayed(m.Provider, m.Model), Responses) {
+		if !slices.Contains(groupServed(m.Provider, m.Model), Responses) {
 			return ""
 		}
 		best = best || n == Responses

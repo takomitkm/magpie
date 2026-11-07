@@ -1,8 +1,10 @@
 package provider
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"os"
 	"testing"
 
 	"github.com/yetone/magpie/internal/settings"
@@ -51,6 +53,9 @@ func TestNativeLearningReaderKeepsPersistedFingerprint(t *testing.T) {
 	}
 	if !p.RememberAPI("local", Chat) {
 		t.Fatal("could not record success")
+	}
+	if b, err := os.ReadFile(learnedAPIPath()); err != nil || !bytes.Contains(b, []byte("chat")) {
+		t.Fatalf("success was not written to %s: %v %s", learnedAPIPath(), err, b)
 	}
 	forgetLearningMemory()
 	if proto, ok := p.LearnedAPIReader()("local"); !ok || proto != Chat {
