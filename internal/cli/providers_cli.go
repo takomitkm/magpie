@@ -828,6 +828,9 @@ func announce(id string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if ms, err := saved.Fetch(ctx); err == nil {
+		if current, err := provider.Find(id); err == nil {
+			saved = current // fetching may have corrected the provider's API
+		}
 		fmt.Println(green.Render("✓"), len(ms), "models from", fetchedFrom(*saved))
 	} else if !saved.DecideOnly() {
 		// the URLs asked and what they said; the base stays as given

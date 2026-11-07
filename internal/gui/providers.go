@@ -2202,7 +2202,7 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 				}
 				var wg sync.WaitGroup
 				wg.Go(func() { provider.PrefillNewKeys(ctx, had, in.ID) })
-				if old == nil || old.Key != p.Key {
+				if old == nil || old.Key != p.Key || p.Account == nil && p.Preset == "" && (old.Chat != p.Chat || old.Responses != p.Responses || old.Anthropic != p.Anthropic || old.Gemini != p.Gemini || !slices.Equal(old.Models, p.Models)) {
 					p.Fetch(ctx)
 				} else if askHub {
 					provider.AskRemoteHub(ctx, in.ID)

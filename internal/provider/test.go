@@ -47,7 +47,17 @@ func (p Provider) Test(ctx context.Context) []Result {
 	if p.DecideOnly() {
 		return p.testDecide(ctx)
 	}
-	_, listErr := p.Fetch(ctx)
+	ms, listErr := p.Fetch(ctx)
+	if corrected, _, ok := p.nativeCorrection(ms); listErr == nil && ok {
+		if saved, err := Find(p.ID); err == nil {
+			// Saving the correction also records the list these picks came
+			// from. That fetched state is not an edit of the test's draft.
+			corrected.PickedFrom = saved.PickedFrom
+			if sameStored(*saved, corrected) {
+				p = *saved
+			}
+		}
+	}
 	if client := testClient(ctx); client != "" {
 		// the one endpoint that agent's requests go to
 		proto := clientProto(client, p.Speaks())

@@ -439,6 +439,9 @@ func (p Provider) fetch(ctx context.Context) ([]catalog.Model, error) {
 		}
 	}
 	if err == nil {
+		if cerr := p.correctNative(ctx, ms); cerr != nil {
+			return ms, cerr
+		}
 		noteSelf(p, ms)
 		if len(ms) > 0 {
 			noteRemoteHub(ctx, p)
