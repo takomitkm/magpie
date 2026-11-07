@@ -54,6 +54,35 @@ const PROTOS = ["chat", "responses", "anthropic", "gemini"];
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
   for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    test(`${engine} ${lang}: new models' detected APIs are staged until Add`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
+      t.after(() => browser.close());
+      const page = await browser.newPage({ viewport: { width: 900, height: 900 }, reducedMotion: "reduce" });
+      const posts = [];
+      await page.route("**/*", serve(lang, posts, (body, json) => {
+        const models = body.detectModels.map((m) => ({ model: m, results: PROTOS.map((p) => one(m, p)) }));
+        return json({ results: PROTOS.map((_, i) => models.find((x) => x.results[i].ok)?.results[i] || models[0].results[i]), models });
+      }));
+      await page.goto("http://magpie.test/?view=providers");
+      await page.locator("#addProvider").click();
+      await page.locator("#addSheet .custom-foot .custom").click();
+      const ed = page.locator(".editor.new");
+      await ed.getByPlaceholder(tr(lang, "e.g. My Relay"), { exact: true }).fill("New relay");
+      await ed.locator(".add-models .detect-row input").fill("m-a, m-b");
+      await ed.locator(".base-url").fill(URL_);
+      await ed.locator('input[type="password"]').first().fill("sk-typed");
+      await ed.locator(".detect-each").click();
+      await ed.locator(".detect-grid").waitFor();
+      await ed.locator(".detect-acts button").first().click();
+      assert.equal(posts.length, 1, "Use these only stages the draft");
+      await ed.locator(":scope > .bar .primary").click();
+      await page.waitForFunction(() => !document.querySelector(".editor.new"));
+      const save = posts.find((p) => p.path === "/api/provider/save");
+      assert(save, "added");
+      assert.deepEqual(save.body.modelPrefs, { "m-a": { api: "chat" } }, "the new provider saves its staged model API");
+    });
+  }
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
     for (const width of [900, 360]) {
       test(`${engine} ${lang} ${width}px: Detect APIs and Each picked model ask the form not saved`, async (t) => {
         const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));

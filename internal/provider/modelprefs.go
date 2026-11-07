@@ -499,7 +499,7 @@ func (p Provider) apiSet(model string) (Protocol, bool) {
 // two) and the one set found already.
 func (p Provider) modelAPIAmong(speaks int, proto Protocol) (Protocol, bool) {
 	// Vertex AI's model id says its one API (ListedAPIs)
-	if speaks < 2 || p.IsVertex() {
+	if speaks < 2 && (p.Account != nil || p.Preset != "") || p.IsVertex() {
 		return "", false
 	}
 	if !modelAPI(proto) || p.Base(proto) == "" {

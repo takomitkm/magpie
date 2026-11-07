@@ -57,13 +57,14 @@ type modelJSON struct {
 	RateWas    float64 `json:"rateWas,omitempty"`   // the rate before a discount running now
 	// Load is how busy its plugin last said the model is, a percent, when
 	// that was within plugin.LoadFresh (magpie.load); nil when unknown
-	Load  *float64 `json:"load,omitempty"`
-	API   string   `json:"api,omitempty"`   // the one API the user said it is asked on
-	Auto  []string `json:"auto,omitempty"`  // the APIs its vendor's list says it is served on, what Auto asks it on
-	NoAPI bool     `json:"noAPI,omitempty"` // the provider has a URL for none of them: agents aren't offered it (provider.NoAPIFor, #2094)
-	Same  string   `json:"same,omitempty"`  // the model the user said it is the same as, for the groups magpie finds (#583)
-	Merge string   `json:"merge,omitempty"` // what those groups merge it by when the user says nothing
-	Kind  string   `json:"kind,omitempty"`  // what the user said it makes: image or video (#1399)
+	Load       *float64 `json:"load,omitempty"`
+	API        string   `json:"api,omitempty"`        // the one API the user said it is asked on
+	LearnedAPI string   `json:"learnedAPI,omitempty"` // the API verified automatically, separate from a user's pick
+	Auto       []string `json:"auto,omitempty"`       // the APIs its vendor's list says it is served on, what Auto asks it on
+	NoAPI      bool     `json:"noAPI,omitempty"`      // the provider has a URL for none of them: agents aren't offered it (provider.NoAPIFor, #2094)
+	Same       string   `json:"same,omitempty"`       // the model the user said it is the same as, for the groups magpie finds (#583)
+	Merge      string   `json:"merge,omitempty"`      // what those groups merge it by when the user says nothing
+	Kind       string   `json:"kind,omitempty"`       // what the user said it makes: image or video (#1399)
 	// Vendor is the provider's own id of a model the user lists by
 	// another (provider.SetModelID), "" for one listed by its own; IDs
 	// says the provider's models can be given ids at all (a key's)
@@ -916,6 +917,7 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 	// Discord, Windows)
 	set := held
 	noAPI := p.NoAPI()
+	learnedAPI := p.LearnedAPIReader()
 	// each model's provider/model ref, made once: the settings' maps and
 	// every agent's hidden list are looked up by it
 	var refs []string
@@ -951,6 +953,8 @@ func providerInfoWith(p provider.Provider, ls provider.Listing, agents []agentUs
 		}
 		if api, ok := p.ModelAPI(m.ID); ok {
 			j.API = string(api)
+		} else if api, ok := learnedAPI(m.ID); ok {
+			j.LearnedAPI = string(api)
 		}
 		for _, a := range p.ListedAPIs(m.ID) {
 			if slices.Contains(provider.Protocols, a) {
@@ -2083,6 +2087,15 @@ func providerRoutes(mux *http.ServeMux, w Windows) {
 					in.BalanceToken = old.BalanceToken
 				}
 				if old != nil {
+					// The editor omits inference provenance. Keep it only while
+					// its endpoint is unchanged, so an ordinary save cannot turn
+					// an inferred URL into a manually configured one.
+					in.NativeInferred = make(map[provider.Protocol]string)
+					for proto, base := range old.NativeInferred {
+						if base != "" && in.Base(proto) == base {
+							in.NativeInferred[proto] = base
+						}
+					}
 					// the other keys are kept apart, in the Accounts list
 					in.Keys = old.Keys
 					// the editor's picks, or as they were

@@ -9402,14 +9402,11 @@ function drawEditor(p, presetID) {
     };
     const urlWrap = el("div", "stack");
     urlWrap.append(seg, url);
-    // the APIs that answered a detection, taken for the provider: their
-    // URLs set, one that wasn't found there (404, 405) cleared, and the
-    // base URL's protocol one of those that answered
+    // Take successful endpoints without erasing URLs on a model's refusal.
     const useDetected = (rs) => {
       carried = null;
       for (const x of rs) {
         if (x.ok) draft[x.protocol] = x.base;
-        else if ((x.status === 404 || x.status === 405) && (draft[x.protocol] || "").trim().replace(/\/+$/, "") === x.base) draft[x.protocol] = "";
       }
       const v = draft[apiField[draft.api]] ? draft.api : ["openai", "responses", "anthropic", "gemini", "decide"].find((a) => draft[apiField[a]]);
       showApi(v || draft.api);
@@ -10154,7 +10151,8 @@ function drawEditor(p, presetID) {
       body.baseAPI = draft.api === "openai" ? "chat" : draft.api;
     }
     if (custom) { body.icon = draft.icon || "generic"; body.iconFrom = draft.iconFrom || ""; body.balanceURL = (draft.balanceURL || "").trim(); body.balancePath = (draft.balancePath || "").trim(); body.balanceMethod = draft.balanceMethod || ""; body.modelsURL = (draft.modelsURL || "").trim(); }
-    if (p) { body.fallback = draft.fallback; body.unlisted = draft.unlisted; body.hiddenDrawers = draft.hiddenDrawers; body.hiddenVideomakers = draft.hiddenVideomakers; body.noModels = noneChosen(); body.bestInFamily = bestChosen(); body.modelPrefs = modelPrefsOfDraft(); Object.assign(body, routingOfDraft(p)); }
+    body.modelPrefs = modelPrefsOfDraft();
+    if (p) { body.fallback = draft.fallback; body.unlisted = draft.unlisted; body.hiddenDrawers = draft.hiddenDrawers; body.hiddenVideomakers = draft.hiddenVideomakers; body.noModels = noneChosen(); body.bestInFamily = bestChosen(); Object.assign(body, routingOfDraft(p)); }
     body.searches = !!draft.searches && searchable();
     if (draft.libraryMCP != null) body.libraryMCP = draft.libraryMCP;
     body.pinUpstream = !!draft.pinUpstream;
@@ -10913,6 +10911,7 @@ function addFormModels(ex) {
 }
 
 function detectAPIs(p, base, use) {
+  const source = p || (draft.copyOf && providers.providers.find((x) => x.id === draft.copyOf)) || null;
   const box = el("div", "detect");
   const row = el("div", "detect-row");
   const go = el("button", "text action", t("Detect APIs"));
@@ -10947,9 +10946,7 @@ function detectAPIs(p, base, use) {
   // what is missing, or what went wrong, said here under the buttons
   // rather than in the toast at the top (#1545)
   const say = (msg, kind) => { out.hidden = false; out.replaceChildren(el("span", "hint detect-say " + kind, msg)); };
-  // the models the form has picked, saved or not: a new provider's typed
-  // or ticked in its Models field (draft.extra), a saved one's chips with
-  // the ids still in its add box
+  // Include saved picks and IDs still typed in the form.
   const picked = () => p ? chosenIds() : (draft.extra || []).filter((id, i, all) => id && all.indexOf(id) === i);
   // no key typed, none saved and none copied: a refusal is likely the key
   const keyless = () => {
@@ -10966,10 +10963,8 @@ function detectAPIs(p, base, use) {
     out.hidden = false;
     out.replaceChildren(el("span", "hint", t("Asking each API…")));
     try {
-      // the URL typed is asked as each API takes it, not as the field
-      // holding it would send it; URLs given under More endpoints as they are.
-      // The form as it stands is asked and nothing is saved: a saved
-      // provider's key (or the copied one's) stands for a key not typed.
+      // Interpret the typed base for each API, keeping other URLs as given.
+      // Probe without saving; use the saved or copied key unless one is typed.
       const body = { ...asTyped(), id: p?.id, base: typedBase, ...extra };
       if (!p && draft.copyOf) Object.assign(body, { new: true, copyOf: draft.copyOf });
       for (const k of ["chat", "responses", "anthropic", "gemini"]) if (body[k] === typedBase) body[k] = "";
@@ -10990,12 +10985,12 @@ function detectAPIs(p, base, use) {
     if (!ok.length) acts.append(noneAnswered());
     else {
       const take = el("button", "text action", t("Use these"));
-      take.title = t("Set the URLs of the APIs that answered; one not found there is cleared");
+      take.title = t("Set the URLs of the APIs that answered; keep the other configured URLs");
       take.onclick = () => { use(r.results); take.disabled = true; take.textContent = t("Taken · save to keep"); };
       acts.append(take);
       // one model the provider serves, answering on some APIs only:
       // it can be asked on one of them alone
-      const pm = p && m && p.models.find((x) => x.id === m);
+      const pm = m && (source?.models.find((x) => x.id === m) || (picked().includes(m) && { id: m }));
       if (pm && ok.length < r.results.filter((x) => x.base).length) {
         for (const x of ok) {
           const label = apiLabel(x.protocol);
@@ -11015,7 +11010,7 @@ function detectAPIs(p, base, use) {
     }
     out.append(acts);
   };
-  // a model's API staged in Names, prices & levels: the one it has saved stages nothing
+  // Stage only changes from the saved API.
   const stageAPI = (pm, proto) => {
     const prefs = draft.modelPrefs = draft.modelPrefs || {};
     const id = pm.id;
@@ -11035,14 +11030,14 @@ function detectAPIs(p, base, use) {
     const grid = el("div", "detect-grid");
     grid.style.gridTemplateColumns = `minmax(0, 1.3fr) repeat(${asked.length}, minmax(0, 1fr))`;
     grid.append(el("span", "dg-head", t("Model")), ...asked.map((a) => el("span", "dg-head", apiLabel(a))));
-    // a model that answered on one API alone, of two or more asked, is
-    // given that one by the Use these
+    // Infer a unique success only after every API was tested.
     const only = {};
     for (const md of r.models) {
       const name = el("code", "dg-model", md.model);
       name.title = md.model;
       grid.append(name);
       const okOn = [];
+      let complete = true;
       for (const a of asked) {
         const x = md.results.find((y) => y.protocol === a) || {};
         const cell = el("span", "dg-cell " + (x.ok ? "ok" : "bad"));
@@ -11053,9 +11048,10 @@ function detectAPIs(p, base, use) {
         cell.append(el("span", "", x.ok ? ledTook(x.ms) : why));
         cell.title = `${md.model} · ${apiLabel(a)}\n` + (x.ok ? t("Answered in {took}", { took: ledTook(x.ms) }) : why);
         if (x.ok) okOn.push(a);
+        else if (!x.status) complete = false;
         grid.append(cell);
       }
-      if (okOn.length === 1 && asked.length > 1) only[md.model] = okOn[0];
+      if (complete && okOn.length === 1 && asked.length > 1) only[md.model] = okOn[0];
     }
     out.append(grid);
     if (ids.length > r.models.length) out.append(el("span", "hint", t("Only the first {n} of {all} models were asked", { n: r.models.length, all: ids.length })));
@@ -11063,17 +11059,18 @@ function detectAPIs(p, base, use) {
     if (!r.results.some((x) => x.ok)) acts.append(noneAnswered());
     else {
       const take = el("button", "text action", t("Use these"));
-      // only a saved provider's models are given an API; a new one's, in
-      // Names, prices & levels once it is saved
-      const give = p ? Object.entries(only).map(([id, a]) => [p.models.find((x) => x.id === id), a]).filter(([pm]) => pm) : [];
-      take.title = give.length ? t("Set the URLs of the APIs that answered, and give each model that answered on one API only that API (staged in Names, prices & levels, made with the Save)")
-        : t("Set the URLs of the APIs that answered; one not found there is cleared");
+      // Only Auto models may take a bulk inference, including unsaved picks.
+      const auto = (pm) => !(draft.modelPrefs?.[pm.id]?.api ?? pm.api);
+      const give = Object.entries(only).map(([id, a]) => [source?.models.find((x) => x.id === id) || { id }, a]).filter(([pm]) => picked().includes(pm.id) && auto(pm));
+      take.title = give.length ? t("Set the URLs of the APIs that answered, and give each Auto model tested on all APIs with one success that API (staged in Names, prices & levels, made with the Save)")
+        : t("Set the URLs of the APIs that answered; keep the other configured URLs");
       take.onclick = () => {
-        for (const [pm, a] of give) stageAPI(pm, a);
+        const applied = give.filter(([pm]) => auto(pm) && picked().includes(pm.id));
+        for (const [pm, a] of applied) stageAPI(pm, a);
         use(r.results);
         take.disabled = true;
         take.textContent = t("Taken · save to keep");
-        if (give.length) status(t("{n} models are asked on the one API that answered them once saved", { n: give.length }), "ok");
+        if (applied.length) status(t("{n} models are asked on the one API that answered them once saved", { n: applied.length }), "ok");
       };
       acts.append(take);
       if (give.length) acts.append(el("span", "hint", give.map(([pm, a]) => t("{model}: {api} only", { model: pm.id, api: apiLabel(a) })).join(" · ")));
@@ -11267,6 +11264,8 @@ function renderModels(p) {
     };
     // the API it is asked on, when one is picked (or staged)
     const now = apis.length && !decidesModel(p, id) ? apiNow(id) : "";
+    const learned = !apiNow(id) && p.models.find((m) => m.id === id)?.learnedAPI;
+    if (learned) c.title = (c.title ? c.title + "\n" : "") + t("Verified on {api}", { api: apiLabel(learned) });
     if (now) {
       const tag = el("span", "badge mapi-tag", apiLabel(now));
       tag.title = t("Asked on {api} alone; right-click to change", { api: apiLabel(now) });

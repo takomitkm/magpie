@@ -47,13 +47,15 @@ func (p Provider) Test(ctx context.Context) []Result {
 	if p.DecideOnly() {
 		return p.testDecide(ctx)
 	}
-	ms, listErr := p.Fetch(ctx)
-	if corrected, _, ok := p.nativeCorrection(ms); listErr == nil && ok {
+	_, listErr := p.Fetch(ctx)
+	if listErr == nil {
 		if saved, err := Find(p.ID); err == nil {
-			// Saving the correction also records the list these picks came
-			// from. That fetched state is not an edit of the test's draft.
-			corrected.PickedFrom = saved.PickedFrom
-			if sameStored(*saved, corrected) {
+			// Accept only endpoint additions and fetched picks from discovery;
+			// a concurrent user edit or an unsaved test draft still wins.
+			before := *saved
+			before.Chat, before.Responses, before.Anthropic = p.Chat, p.Responses, p.Anthropic
+			before.NativeInferred, before.PickedFrom = p.NativeInferred, p.PickedFrom
+			if sameStored(before, p) {
 				p = *saved
 			}
 		}

@@ -137,13 +137,27 @@ func (p Provider) APIs(model string) []Protocol { return p.apisAmong(p.Speaks(),
 
 // apisAmong is APIs with the protocols p speaks found already.
 func (p Provider) apisAmong(speaks []Protocol, model string) []Protocol {
+	return p.apisAmongWith(speaks, model, p.LearnedAPI)
+}
+
+func (p Provider) apisAmongWith(speaks []Protocol, model string, learned func(string) (Protocol, bool)) []Protocol {
 	// the one the user said it is asked on, whatever the list says
 	if proto, ok := p.apiSet(model); ok {
 		if proto, ok := p.modelAPIAmong(len(speaks), proto); ok {
 			return []Protocol{proto}
 		}
 	}
-	return p.ListedAPIs(model)
+	if proto, ok := learned(model); ok {
+		return []Protocol{proto}
+	}
+	apis := p.ListedAPIs(model)
+	if apis != nil && len(p.NativeInferred) > 0 {
+		apis = slices.DeleteFunc(slices.Clone(apis), p.inferredAPI)
+		if apis == nil {
+			return []Protocol{} // a known declaration with no verified endpoint
+		}
+	}
+	return apis
 }
 
 // ListedAPIs are the APIs model is served on as its vendor says, whatever

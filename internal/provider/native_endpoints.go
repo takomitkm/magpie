@@ -26,8 +26,12 @@ func relayed(p Provider, model string) []Protocol {
 		return nil
 	}
 	apis := p.APIs(model)
+	speaks := p.Speaks()
+	if apis == nil && p.Account == nil && p.Preset == "" && (len(speaks) > 1 || slices.ContainsFunc(speaks, p.inferredAPI)) {
+		return nil // unknown does not confirm every ambiguous or inferred API
+	}
 	var out []Protocol
-	for _, pr := range p.Speaks() {
+	for _, pr := range speaks {
 		if slices.Contains(Protocols, pr) && (apis == nil || slices.Contains(apis, pr)) {
 			out = append(out, pr)
 		}

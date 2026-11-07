@@ -17,10 +17,10 @@ const { chromium, webkit } = require("playwright");
 const assets = path.resolve(__dirname, "../assets");
 const ROOT = "https://relay.example.com";
 
-function serve(lang, posts) {
+function serve(lang, posts, configured = false) {
   const state = { agents: [], profiles: [], settings: { lang, theme: "light" } };
   const models = ["m-mixed", "m-plain"].map((id) => ({ id, name: id, on: true }));
-  const provider = { id: "relay", name: "Relay", icon: "generic", chat: ROOT + "/v1", responses: "", anthropic: "", models, agents: [], fallback: [], headers: {}, key: { set: true, masked: "sk-…1234" }, keyList: [], ready: true };
+  const provider = { id: "relay", name: "Relay", icon: "generic", chat: ROOT + "/v1", responses: configured ? ROOT + "/v1" : "", anthropic: "", models, agents: [], fallback: [], headers: {}, key: { set: true, masked: "sk-…1234" }, keyList: [], ready: true };
   const providers = { providers: [provider], presets: [], excluded: [], gateway: { running: true, window: true } };
   return async (route) => {
     const url = new URL(route.request().url());
@@ -50,7 +50,26 @@ function serve(lang, posts) {
 }
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  for (const lang of ["en", "zh"]) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    test(`${engine} ${lang}: a model's 404 keeps the configured API URL`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
+      t.after(() => browser.close());
+      const page = await browser.newPage({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" });
+      const posts = [];
+      await page.route("**/*", serve(lang, posts, true));
+      await page.goto("http://magpie.test/?view=providers");
+      await page.locator(".row.provider").click();
+      const ed = page.locator(".editor");
+      await ed.locator(".detect-row button").first().click();
+      await ed.locator(".detect-acts button").first().click();
+      await ed.locator(":scope > .bar .primary").click();
+      await page.waitForFunction(() => !document.querySelector(".editor"));
+      const save = posts.find((p) => p.path === "/api/provider/save");
+      assert(save, "saved");
+      assert.equal(save.body.responses, ROOT + "/v1", "a single model's missing endpoint does not erase the configured URL");
+    });
+  }
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
     test(`${engine} ${lang}: Detect APIs, Use these, and a model's API`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
       const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
@@ -67,13 +86,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=providers");
-      const zh = lang === "zh";
-      const L = {
-        detect: zh ? "检测协议" : "Detect APIs", use: zh ? "使用检测结果" : "Use these", taken: zh ? "已填入 · 保存后生效" : "Taken · save to keep",
-        only: zh ? "m-mixed 只用 Anthropic 协议" : "Ask m-mixed on Anthropic only", said: zh ? "保存后 m-mixed 将使用 Anthropic 协议" : "m-mixed is asked on Anthropic once saved",
-        names: zh ? "名称、价格与推理档位" : "Names, prices & levels", auto: zh ? "自动" : "Auto", unsaved: zh ? "未保存" : "unsaved", save: zh ? "保存" : "Save",
-        ms: zh ? "321 毫秒" : "321 ms",
-      };
+      const L = await page.evaluate(() => ({
+        detect: t("Detect APIs"), use: t("Use these"), taken: t("Taken · save to keep"),
+        only: t("Ask {model} on {api} only", { model: "m-mixed", api: "Anthropic" }),
+        said: t("{model} is asked on {api} once saved", { model: "m-mixed", api: "Anthropic" }),
+        names: t("Names, prices & levels"), auto: t("Auto"), unsaved: t("unsaved"), save: t("Save"), ms: ledTook(321),
+      }));
       await page.locator(".row.provider").click();
       const ed = page.locator(".editor");
       await ed.locator(".detect").waitFor();
@@ -147,7 +165,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const missing = await page.evaluate(() => [
         "Detect APIs", "Send the smallest request to each API (OpenAI chat completions, Responses, Anthropic messages, Gemini generateContent) at this URL, to see which answer",
         "model to try · empty picks one from the vendor's list", "Type the base URL first", "Asking each API…", "model {model}",
-        "None answered: check the URL and the key, or type a model the vendor serves", "Use these", "Set the URLs of the APIs that answered; one not found there is cleared",
+        "None answered: check the URL and the key, or type a model the vendor serves", "Use these", "Set the URLs of the APIs that answered; keep the other configured URLs",
         "Taken · save to keep", "Ask {model} on {api} only", "Staged in Names, prices & levels and made with the Save; Auto there gives it back", "{model} is asked on {api} once saved",
         "no URL to ask", "no model to try: type one the vendor serves", "no key is on for this endpoint",
         "an embedding model: asked at OpenAI's URL, on /embeddings", "a rerank model: asked at OpenAI's URL, on /rerank",

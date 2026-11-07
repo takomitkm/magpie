@@ -113,6 +113,10 @@ type Provider struct {
 	// first API with a URL (01huadalang: Responses picked and saved came
 	// back as OpenAI compatible). Requests go by which URLs are set.
 	BaseAPI string `json:"baseAPI,omitempty"`
+	// NativeInferred records bases added by model verification. These bases
+	// require success evidence for each model; editing a base removes that
+	// restriction automatically. It is not a user API preference.
+	NativeInferred map[Protocol]string `json:"nativeInferred,omitempty"`
 
 	// Fallback is where a request goes when this provider can't take it —
 	// out of quota, rate limited, overloaded or down — before any of the
@@ -874,6 +878,7 @@ func (p Provider) clone() Provider {
 	p.PickedFrom = slices.Clone(p.PickedFrom)
 	p.Delisted = slices.Clone(p.Delisted)
 	p.AutoInclude = slices.Clone(p.AutoInclude)
+	p.NativeInferred = maps.Clone(p.NativeInferred)
 	p.Headers = maps.Clone(p.Headers)
 	p.ExtraBody = maps.Clone(p.ExtraBody)
 	p.ReplyHeaders = slices.Clone(p.ReplyHeaders)
@@ -1424,6 +1429,17 @@ func AddCopy(p Provider, from string) (string, error) {
 	p.Unredacted = p.Unredacted || src.Unredacted
 	p.CountFree = p.CountFree || src.CountFree
 	p.NativeCompaction = p.NativeCompaction || src.NativeCompaction
+	// A copied inferred base is still inferred, until the copy validates
+	// its own models. A base the user changed is their explicit endpoint.
+	p.NativeInferred = maps.Clone(p.NativeInferred)
+	for proto, base := range src.NativeInferred {
+		if base != "" && p.Base(proto) == base {
+			if p.NativeInferred == nil {
+				p.NativeInferred = map[Protocol]string{}
+			}
+			p.NativeInferred[proto] = base
+		}
+	}
 	p.PassUserAgent = p.PassUserAgent || src.PassUserAgent
 	if p.Website == "" {
 		p.Website = src.Website
@@ -2113,6 +2129,12 @@ func (p Provider) Native(model string) Protocol {
 		case "claude", "devin":
 			return ""
 		}
+	}
+	if pr, ok := p.ModelAPI(model); ok {
+		return pr
+	}
+	if pr, ok := p.LearnedAPI(model); ok {
+		return pr
 	}
 	apis := p.APIs(model)
 	var out []Protocol

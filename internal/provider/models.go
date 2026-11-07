@@ -1802,9 +1802,10 @@ func (p Provider) NoAPI() func(model string) bool {
 	if len(speaks) == 0 {
 		return func(string) bool { return false }
 	}
+	learned := p.LearnedAPIReader()
 	return func(model string) bool {
-		apis := p.apisAmong(speaks, model)
-		return len(apis) > 0 && !slices.ContainsFunc(speaks, func(s Protocol) bool { return slices.Contains(apis, s) })
+		apis := p.apisAmongWith(speaks, model, learned)
+		return apis != nil && !slices.ContainsFunc(speaks, func(s Protocol) bool { return slices.Contains(apis, s) })
 	}
 }
 

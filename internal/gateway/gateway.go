@@ -5202,6 +5202,11 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	if id := prevLost(r); id != "" && p.Account != nil && (p.Account.Agent == "claude" || p.Account.Agent == "codex") {
 		return writePrevNotFound(w, id)
 	}
+	// Ambiguous protocol refusals may only explore this candidate's current
+	// credential and configured endpoints, without shared rejection marks.
+	if probe := newProtocolProbe(p, model, body); probe != nil {
+		r = r.WithContext(context.WithValue(r.Context(), protocolProbeKey{}, probe))
+	}
 	// every request to the provider goes through its own proxy, if it has
 	// one (#237)
 	r = r.WithContext(p.Via(r.Context()))
@@ -5233,6 +5238,9 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	// back whole (gathers)
 	relayable := slices.Contains(s.usable(p, model), from) && (p.Account == nil || !p.Account.Stream || streamOf(body) || gathers(p, from, body))
 	relay := relayable
+	if learned, ok := p.LearnedAPI(model); ok && learned != from && slices.Contains(s.usable(p, model), learned) {
+		relay = false
+	}
 	// a Claude model is asked on Messages whatever API the client spoke,
 	// for the cache breakpoints the translation adds: OpenCode speaks Chat
 	// for every model, and a relay drops cache_control on Chat, so every
@@ -5352,6 +5360,11 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 		return writeError(w, from, 400, msg), msg
 	}
 	to := s.usable(p, model)
+	if probe := probeOf(r.Context()); probe != nil && probe.original != nil {
+		if next, ok := probe.next(s, p, model); ok {
+			to = []provider.Protocol{next}
+		}
+	}
 	if len(to) == 0 {
 		// every API turned the model away: the one the user picked for it
 		// is asked again, not the first the provider has a URL for, which
@@ -5374,6 +5387,13 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 		return writePrevNotFound(w, id)
 	}
 	call.To = to[0]
+	if probe := probeOf(r.Context()); probe != nil && probe.original != nil {
+		status, msg := s.translateProbed(w, r, p, from, to[0], model, body, &call.Usage, probe)
+		if !probe.success {
+			call.To = probe.from
+		}
+		return status, msg
+	}
 	return s.translate(w, r, p, from, to[0], model, body, &call.Usage)
 }
 
@@ -5381,6 +5401,9 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 // from at p, which usable puts first: Responses for an OpenAI model on
 // OpenAI's API, Messages for a Claude model where it is served.
 func firstElsewhere(p provider.Provider, model string, from provider.Protocol) bool {
+	if learned, ok := p.LearnedAPI(model); ok && learned != from {
+		return true
+	}
 	return p.ResponsesFirst(model) && from != provider.Responses || p.MessagesFirst(model) && from != provider.Anthropic
 }
 
@@ -5459,6 +5482,11 @@ func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.P
 		ctx = context.WithValue(ctx, dsSentKey{}, &dsSent{})
 	}
 	res, err = s.forwardOnce(ctx, p, to, path, body, in)
+	if probe := probeOf(ctx); probe != nil && probe.original != nil {
+		// Discovery asks each allowed protocol once, with no speculative
+		// shape changes or shared feature marks on a failed probe.
+		return res, err
+	}
 	if err != nil {
 		// a Remote magpie whose computer came back at another address
 		// is asked there (provider's remote_moved.go)
@@ -6372,6 +6400,20 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		status, msg := passError(w, p, proto, proto, res, u)
 		return status, msg, true
 	}
+	if probe := probeOf(r.Context()); probe != nil && (res.StatusCode == 400 || res.StatusCode == 404) {
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		res.Body.Close()
+		res.Body = io.NopCloser(bytes.NewReader(b))
+		if ambiguousProtocolRefusal(res.StatusCode, b) {
+			probe.visited[proto] = true
+			if _, ok := probe.next(s, p, model); ok {
+				probe.save(res, proto, b)
+				res.Body.Close()
+				u.RequestID = ""
+				return res.StatusCode, explained(p, model, res, b), false
+			}
+		}
+	}
 	// structured output turned away (Xiaomi MiMo's Token Plan takes no
 	// json_schema, only text and json_object, #2126): a schema is asked
 	// for as any JSON object with the schema in the system prompt, and if
@@ -6709,6 +6751,14 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	if res.StatusCode >= 400 {
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		msg := explained(p, model, res, b)
+		if probe := probeOf(r.Context()); probe != nil && ambiguousProtocolRefusal(res.StatusCode, b) {
+			probe.visited[proto] = true
+			if _, ok := probe.next(s, p, model); ok {
+				probe.save(res, proto, b)
+				u.RequestID = ""
+				return res.StatusCode, msg, false
+			}
+		}
 		if wrongEndpoint(res.StatusCode, b) {
 			s.markUnfit(p.ID, model, proto)
 			if len(s.usable(p, model)) > 0 {
@@ -7352,7 +7402,10 @@ func (s *Server) markUnfit(providerID, model string, proto provider.Protocol) {
 // Messages API is served, which alone keeps its cache_control and
 // thinking (#997).
 func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
-	apis := p.APIs(model)
+	apis := p.ListedAPIs(model)
+	if explicit, ok := p.ModelAPI(model); ok {
+		apis = []provider.Protocol{explicit}
+	}
 	var out []provider.Protocol
 	for _, proto := range p.Speaks() {
 		if s.fits(p.ID, model, proto) && (apis == nil && !p.NamedOnlyOn(proto) || slices.Contains(apis, proto)) {
@@ -7365,6 +7418,13 @@ func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
 	if p.MessagesFirst(model) {
 		sort.SliceStable(out, func(i, j int) bool { return out[i] == provider.Anthropic && out[j] != provider.Anthropic })
 	}
+	if _, explicit := p.ModelAPI(model); !explicit {
+		if learned, ok := p.LearnedAPI(model); ok && s.fits(p.ID, model, learned) && slices.Contains(p.Speaks(), learned) {
+			// Actual success overrides catalog declarations, but remains a
+			// preference: the other declared protocols remain available.
+			out = append([]provider.Protocol{learned}, slices.DeleteFunc(out, func(proto provider.Protocol) bool { return proto == learned })...)
+		}
+	}
 	return out
 }
 
@@ -7374,7 +7434,23 @@ func (s *Server) usable(p provider.Provider, model string) []provider.Protocol {
 // Claude models only /chat/completions — so when it says the model isn't
 // served on this one, the request is built again for the next endpoint it
 // speaks, and the model is remembered there.
-func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to provider.Protocol, req *Request, model string, in http.Header) (*http.Response, provider.Protocol, error) {
+func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to provider.Protocol, req *Request, model string, in http.Header) (reply *http.Response, actual provider.Protocol, failure error) {
+	probe := probeOf(ctx)
+	settledProbe := probe != nil && probe.success
+	if settledProbe {
+		// A continuation after accepted output stays on the protocol that
+		// answered. It must never reopen discovery and splice another API.
+		probe = nil
+		ctx = context.WithValue(ctx, protocolProbeKey{}, (*protocolProbe)(nil))
+	}
+	defer func() {
+		if probe != nil && probe.original != nil && !probe.success {
+			if reply != nil && reply != probe.original {
+				reply.Body.Close()
+			}
+			reply, actual, failure = probe.restore(ctx, p)
+		}
+	}()
 	if req.ThinkOff && req.Effort != "none" && slices.Contains(p.Efforts(model), "none") {
 		// the client turned reasoning off (Effort reads that as low), and
 		// the model can stop thinking: asked for none (#899)
@@ -7429,7 +7505,12 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 	// the reply limit was filled in, the client having named none
 	// (fillsOutput)
 	filledOutput := false
+	var probeCancel context.CancelFunc
 	for {
+		if probe != nil && probe.original != nil && probeCancel == nil {
+			ctx, probeCancel = context.WithTimeout(ctx, 30*time.Second)
+			defer probeCancel()
+		}
 		if req.hourMarks && !s.fits(p.ID, hourMarksRefused, to) {
 			r := *req
 			r.hourMarks, req = false, &r
@@ -7670,6 +7751,29 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			path = "/beta" + path
 		}
 		res, err := s.forward(ctx, p, to, path, p.Prepare(body), in)
+		if settledProbe {
+			return res, to, err
+		}
+		if probe != nil && probe.original != nil {
+			probe.visited[to] = true
+			if err == nil && res.StatusCode >= 200 && res.StatusCode < 300 && validProbeReply(res, p, to, req) {
+				probe.success = true
+				// A name changed while this request was in flight belongs
+				// to the next request, not to this old wire's evidence.
+				if probe.own == p.OwnModelID(model) && wire == provider.UpstreamNameAs(p, model, probe.own) {
+					p.RememberAPI(model, to)
+				}
+				return res, to, nil
+			}
+			if res != nil {
+				res.Body.Close()
+			}
+			if next, ok := probe.next(s, p, model); ok && ctx.Err() == nil {
+				to = next
+				continue
+			}
+			return nil, to, err // the deferred restore returns the first refusal
+		}
 		if err != nil || res.StatusCode < 400 {
 			if dropped && err == nil {
 				// it was the key: not sent there again
@@ -7688,6 +7792,14 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		res.Body.Close()
 		res.Body = io.NopCloser(bytes.NewReader(b))
+		if probe != nil && ambiguousProtocolRefusal(res.StatusCode, b) {
+			probe.save(res, to, b)
+			if next, ok := probe.next(s, p, model); ok {
+				to = next
+				continue
+			}
+			return res, to, nil
+		}
 		if filledOutput && outputFieldRefused(res.StatusCode, b) {
 			// the model's own limit, filled in, turned away (a list or
 			// models.dev saying more than the vendor takes): asked again

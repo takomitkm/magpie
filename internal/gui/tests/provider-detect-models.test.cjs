@@ -19,12 +19,12 @@ const assets = path.resolve(__dirname, "../assets");
 const ROOT = "https://relay.example.com";
 const IDS = ["m-both", "m-resp", "m-chat"];
 // what each model answers on: chat, responses, anthropic
-const SERVES = { "m-both": ["chat", "responses"], "m-resp": ["responses"], "m-chat": ["chat"] };
+const SERVES = { "m-both": ["chat", "responses"], "m-resp": ["responses"], "m-chat": ["chat"], "m-draft": ["responses"], "m-typed": ["responses"] };
 
-function serve(lang, posts) {
+function serve(lang, posts, regression = false) {
   const state = { agents: [], profiles: [], settings: { lang, theme: "light" } };
-  const models = IDS.map((id) => ({ id, name: id, on: true }));
-  const provider = { id: "relay", name: "Relay", icon: "generic", chat: ROOT + "/v1", responses: "", anthropic: "", models, agents: [], fallback: [], headers: {}, key: { set: true, masked: "sk-…1234" }, keyList: [], ready: true };
+  const models = [...IDS, ...(regression ? ["m-draft"] : [])].map((id) => ({ id, name: id, on: true, ...(regression && id === "m-resp" ? { api: "chat", learnedAPI: "anthropic" } : {}), ...(regression && id === "m-both" ? { learnedAPI: "responses" } : {}) }));
+  const provider = { id: "relay", name: "Relay", icon: "generic", chat: ROOT + "/v1", responses: regression ? ROOT + "/v1" : "", anthropic: "", models, agents: [], fallback: [], headers: {}, key: { set: true, masked: "sk-…1234" }, keyList: [], ready: true };
   const providers = { providers: [provider], presets: [], excluded: [], gateway: { running: true, window: true } };
   const one = (m, proto) => {
     const base = proto === "anthropic" ? ROOT : ROOT + "/v1";
@@ -43,7 +43,7 @@ function serve(lang, posts) {
     if (url.pathname === "/api/provider/detect") {
       const body = route.request().postDataJSON();
       posts.push({ path: url.pathname, body });
-      const each = body.detectModels.map((m) => ({ model: m, results: ["chat", "responses", "anthropic"].map((p) => one(m, p)) }));
+      const each = body.detectModels.map((m) => ({ model: m, results: ["chat", "responses", "anthropic"].map((p) => regression && m === "m-chat" && p === "responses" ? { protocol: p, base: ROOT + "/v1", error: "not asked: out of time" } : one(m, p)) }));
       const results = [0, 1, 2].map((i) => each.find((x) => x.results[i].ok)?.results[i] || each[0].results[i]);
       return json({ results, models: each });
     }
@@ -73,7 +73,66 @@ async function rclick(loc) {
 }
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
-  for (const lang of ["en", "zh"]) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    test(`${engine} ${lang}: copied models keep their explicit API after detection`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
+      const page = await browser.newPage({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" });
+      t.after(async () => {
+        if (process.env.ARTIFACT_DIR) {
+          await fs.mkdir(process.env.ARTIFACT_DIR, { recursive: true });
+          await page.screenshot({ path: path.join(process.env.ARTIFACT_DIR, `${engine}-${lang}-detect-copy.png`), fullPage: true, timeout: 5000 }).catch(() => {});
+        }
+        await browser.close();
+      });
+      const posts = [];
+      await page.route("**/*", serve(lang, posts, true));
+      // Start in the editor: the initial providers read may replace list rows.
+      await page.goto("http://magpie.test/?view=providers&edit=relay");
+      const duplicate = await page.evaluate(() => t("Duplicate"));
+      await page.locator(".editor > .bar").getByRole("button", { name: duplicate, exact: true }).click();
+      const ed = page.locator(".editor.new");
+      await ed.locator(".detect-each").click();
+      await ed.locator(".detect-grid").waitFor();
+      await ed.locator(".detect-acts button").first().click();
+      assert.equal(posts.length, 1, "copy detection stages without saving");
+      await ed.locator(":scope > .bar .primary").click();
+      await page.waitForFunction(() => !document.querySelector(".editor.new"));
+      const save = posts.find((p) => p.path === "/api/provider/save");
+      assert(save, "copy saved");
+      assert.equal(save.body.copyOf, "relay");
+      assert.deepEqual(save.body.modelPrefs, { "m-draft": { api: "responses" } }, "the copied explicit API is retained, while Auto may take a verified API");
+    });
+    test(`${engine} ${lang}: bulk detection keeps explicit and untested model APIs`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
+      t.after(() => browser.close());
+      const page = await browser.newPage({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" });
+      const posts = [];
+      await page.route("**/*", serve(lang, posts, true));
+      await page.goto("http://magpie.test/?view=providers");
+      await page.locator(".row.provider").click();
+      const ed = page.locator(".editor");
+      const [verified, manualVerified] = await page.evaluate(() => [t("Verified on {api}", { api: "Responses" }), t("Verified on {api}", { api: "Anthropic" })]);
+      const chip = (id) => ed.locator(".mchips .mchip", { hasText: id });
+      assert((await chip("m-both").getAttribute("title") || "").includes(verified), "Auto explains the verified API");
+      assert(!(await chip("m-resp").getAttribute("title") || "").includes(manualVerified), "a manual API is not presented as an automatic result");
+      assert(!(await chip("m-chat").getAttribute("title") || "").includes(verified), "unknown has no verified API");
+      const words = await page.evaluate(() => ({ names: t("Names, prices & levels"), add: t("add a model id…") }));
+      await ed.getByPlaceholder(words.add, { exact: true }).fill("m-typed");
+      await ed.getByRole("button", { name: words.names, exact: true }).click();
+      const staged = ed.locator(".mname", { has: page.locator("code", { hasText: "m-draft" }) });
+      await staged.locator('.mapi .opt[data-api="chat"]').click();
+      await ed.locator(".detect-each").click();
+      await ed.locator(".detect-grid").waitFor();
+      await ed.locator(".detect-acts button").first().click();
+      await ed.locator(":scope > .bar .primary").click();
+      await page.waitForFunction(() => !document.querySelector(".editor"));
+      const save = posts.find((p) => p.path === "/api/provider/save");
+      assert(save, "saved");
+      assert.deepEqual(save.body.modelPrefs, { "m-draft": { api: "chat" }, "m-typed": { api: "responses" } }, "saved and draft explicit APIs stay; multiple successes and untested APIs stay Auto; a newly typed pick is staged");
+      assert(save.body.models.includes("m-typed"), "the typed model is saved with its API");
+    });
+  }
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
     test(`${engine} ${lang}: Detect APIs model by model, and Test says the API`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: process.env.PLAYWRIGHT_CHANNEL || "chromium" }));
       const page = await (await browser.newContext({ viewport: { width: 900, height: 760 }, reducedMotion: "reduce" })).newPage();
@@ -90,16 +149,14 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=providers");
-      const zh = lang === "zh";
-      const L = {
-        each: zh ? "逐个检测已选模型" : "Each picked model", use: zh ? "使用检测结果" : "Use these", taken: zh ? "已填入 · 保存后生效" : "Taken · save to keep",
-        only: zh ? "m-resp：仅 Responses · m-chat：仅 OpenAI" : "m-resp: Responses only · m-chat: OpenAI only",
-        said: zh ? "保存后 2 个模型将只使用各自唯一可用的协议" : "2 models are asked on the one API that answered them once saved",
-        names: zh ? "名称、价格与推理档位" : "Names, prices & levels", unsaved: zh ? "未保存" : "unsaved", save: zh ? "保存" : "Save",
-        item: zh ? "测试此模型" : "Test this model",
-        via: zh ? "m-both 通过 Responses 协议在 123 毫秒内响应" : "m-both answered via Responses in 123 ms",
-        viaTitle: zh ? "通过 Responses 协议在 123 毫秒内响应" : "Answered via Responses in 123 ms",
-      };
+      const L = await page.evaluate(() => ({
+        each: t("Each picked model"), use: t("Use these"), taken: t("Taken · save to keep"),
+        only: t("{model}: {api} only", { model: "m-resp", api: "Responses" }) + " · " + t("{model}: {api} only", { model: "m-chat", api: "OpenAI" }),
+        said: t("{n} models are asked on the one API that answered them once saved", { n: 2 }),
+        names: t("Names, prices & levels"), unsaved: t("unsaved"), save: t("Save"), item: t("Test this model"),
+        via: t("{model} answered via {api} in {took}", { model: "m-both", api: "Responses", took: ledTook(123) }),
+        viaTitle: t("Answered via {api} in {took}", { api: "Responses", took: ledTook(123) }), ms: ledTook(120),
+      }));
       await page.locator(".row.provider").click();
       const ed = page.locator(".editor");
       await ed.locator(".detect").waitFor();
@@ -135,7 +192,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const why = ed.locator('.detect-grid .dg-cell[data-model="m-resp"][data-api="chat"]');
       assert((await why.textContent()).startsWith("400 · model m-resp is not supported"), "a ✗ says why");
       assert((await why.getAttribute("title")).includes("m-resp · OpenAI"));
-      assert.equal(await ed.locator('.detect-grid .dg-cell[data-model="m-both"][data-api="chat"]').textContent(), zh ? "120 毫秒" : "120 ms");
+      assert.equal(await ed.locator('.detect-grid .dg-cell[data-model="m-both"][data-api="chat"]').textContent(), L.ms);
       assert.equal(await ed.locator(".detect-acts .hint").textContent(), L.only);
 
       // Use these: Responses' URL set, the two models staged, nothing sent
@@ -176,7 +233,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const missing = await page.evaluate(() => [
         "Each picked model", "Ask every model picked below on each API, to see which API serves which model (up to {n}, a few at a time)",
         "Pick models first, or type one and press Detect APIs", "Only the first {n} of {all} models were asked", "Model",
-        "Set the URLs of the APIs that answered, and give each model that answered on one API only that API (staged in Names, prices & levels, made with the Save)",
+        "Set the URLs of the APIs that answered, and give each Auto model tested on all APIs with one success that API (staged in Names, prices & levels, made with the Save)",
         "{n} models are asked on the one API that answered them once saved", "{model}: {api} only",
         "an image model: asked on the images API, not here", "not asked: out of time",
         "Answered via {api} in {took}", "{model} answered via {api} in {took}", "{model} didn't answer via {api}: {error}",

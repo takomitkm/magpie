@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -20,8 +19,8 @@ const nativeMessagesAnswer = `{"id":"m","type":"message","role":"assistant","con
 
 // The reported relay accepts Chat, but advertises its model on Messages.
 // A direct provider/model request used to work while its only routing
-// group's member was struck out by NoAPI. Fetch must correct the saved
-// protocol, not leave the old Chat URL beside the new one.
+// group's member was struck out by NoAPI. Fetch adds a verified sibling
+// and remembers the model's API while preserving the configured base.
 func TestNativeCorrectionRestoresRoutingGroup(t *testing.T) {
 	for _, prefix := range []string{"", "/gateway"} {
 		t.Run(prefix, func(t *testing.T) {
@@ -62,7 +61,7 @@ func TestNativeCorrectionRestoresRoutingGroup(t *testing.T) {
 				t.Fatal(err)
 			}
 			q := mustNativeProvider(t, p.ID)
-			if q.Chat != "" || q.Responses != "" || q.Anthropic != root || q.BaseAPI != "anthropic" {
+			if q.Chat != p.Chat || q.Responses != "" || q.Anthropic != root || q.BaseAPI != p.BaseAPI {
 				t.Fatalf("native API was not corrected: chat=%q responses=%q anthropic=%q baseAPI=%q", q.Chat, q.Responses, q.Anthropic, q.BaseAPI)
 			}
 			if !q.Unlisted || q.Key != p.Key || q.Proxy != p.Proxy || !slices.Equal(q.Models, p.Models) {
@@ -104,7 +103,7 @@ func TestNativeCorrectionFirstTestUsesCorrectedAPI(t *testing.T) {
 	}
 	p = mustNativeProvider(t, p.ID)
 	results := p.Test(context.Background())
-	if len(results) != 1 || !results[0].OK || results[0].Protocol != Anthropic {
+	if !slices.ContainsFunc(results, func(r Result) bool { return r.OK && r.Protocol == Anthropic }) {
 		t.Fatalf("first Test used the stale API: %+v", results)
 	}
 }
@@ -128,6 +127,9 @@ func TestNativeCorrectionKeepsUnverifiedConfiguration(t *testing.T) {
 		{"missing", 404, `not found`},
 		{"login page", 200, `<html>sign in</html>`},
 		{"wrapped error", 200, `{"error":{"message":"refused"}}`},
+		{"false success", 200, `{"success":false,"type":"message","content":[]}`},
+		{"error with answer", 200, `{"error":{"message":"refused"},"type":"message","content":[]}`},
+		{"truncated answer", 200, `{"type":"message","content":[`},
 		{"wrong protocol", 200, `{"choices":[{"message":{"content":"OK"}}]}`},
 	} {
 		t.Run(reply.name, func(t *testing.T) {
@@ -298,7 +300,7 @@ func TestNativeCorrectionNeverProbesDisabledModels(t *testing.T) {
 			if all && (posts.Load() != 0 || q.Chat != p.Chat) {
 				t.Fatal("all-disabled provider was probed or corrected")
 			}
-			if !all && (posts.Load() != 1 || q.BaseAPI != "anthropic") {
+			if !all && (posts.Load() != 1 || q.Native("b") != Anthropic || q.BaseAPI != p.BaseAPI) {
 				t.Fatal("enabled model was not used to verify the native API")
 			}
 		})
@@ -338,55 +340,33 @@ func TestNativeCorrectionUsesLocalModelID(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := mustNativeProvider(t, p.ID)
-	if posts.Load() != 1 || q.BaseAPI != "anthropic" || !slices.Equal(q.Models, []string{"fast"}) {
+	if posts.Load() != 1 || q.Native("fast") != Anthropic || q.BaseAPI != p.BaseAPI || !slices.Equal(q.Models, []string{"fast"}) {
 		t.Fatal("native correction lost the local model ID or sent it upstream")
 	}
 }
 
-func TestNativeCorrectionPlansOnlyUnambiguousAPIs(t *testing.T) {
-	detectHome(t)
-	p := Provider{ID: "relay", Name: "Relay", Key: "fake-key", Chat: "https://relay.example/gateway/v1", BaseAPI: "chat", Models: []string{"a"}}
-	ms := []catalog.Model{{ID: "a", APIs: []string{"anthropic"}}}
+func TestNativeCorrectionInfersOnlyStandardSiblings(t *testing.T) {
+	p := Provider{Chat: "https://relay.example/gateway/v1", BaseAPI: "chat"}
 	for _, tc := range []struct {
 		name   string
 		change func(*Provider)
-		models []catalog.Model
 	}{
-		{"usage only", func(p *Provider) { p.Models = nil; p.NoModels = true }, ms},
-		{"switched off", func(p *Provider) { p.Off = true }, ms},
-		{"preset", func(p *Provider) { p.Preset = "openai" }, ms},
-		{"independent endpoint", func(p *Provider) { p.Responses = "https://other.example/v1" }, ms},
-		{"protocol key", func(p *Provider) { p.KeyProtocol = Chat }, ms},
-		{"custom path", func(p *Provider) { p.Chat = "https://relay.example/custom" }, ms},
-		{"query", func(p *Provider) { p.Chat += "?tenant=x" }, ms},
-		{"model missing", func(p *Provider) { p.Models = []string{"missing"} }, ms},
-		{"unknown API", func(p *Provider) {}, []catalog.Model{{ID: "a"}}},
-		{"multiple APIs", func(p *Provider) {}, []catalog.Model{{ID: "a", APIs: []string{"chat", "anthropic"}}}},
-		{"mixed picks", func(p *Provider) { p.Models = []string{"a", "b"} }, append(slices.Clone(ms), catalog.Model{ID: "b", APIs: []string{"chat"}})},
-		{"absolute endpoint", func(p *Provider) {}, []catalog.Model{{ID: "a", APIs: []string{"https://other.example/v1/messages"}}}},
+		{"independent endpoint", func(p *Provider) { p.Responses = "https://other.example/v1" }},
+		{"protocol key", func(p *Provider) { p.KeyProtocol = Chat }},
+		{"custom path", func(p *Provider) { p.Chat = "https://relay.example/custom" }},
+		{"query", func(p *Provider) { p.Chat += "?tenant=x" }},
+		{"userinfo", func(p *Provider) { p.Chat = "https://user:pass@relay.example/v1" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := p
 			tc.change(&q)
-			if _, _, ok := q.nativeCorrection(tc.models); ok {
-				t.Fatal("ambiguous provider was corrected")
+			if _, ok := q.inferredEndpoint(Anthropic); ok {
+				t.Fatal("inferred an ambiguous sibling")
 			}
 		})
 	}
-	for _, pr := range []Protocol{Chat, Responses, Anthropic} {
-		t.Run(fmt.Sprint(pr), func(t *testing.T) {
-			q := p
-			q.Chat = ""
-			q.Anthropic = "https://relay.example/gateway"
-			q.BaseAPI = "anthropic"
-			target := pr
-			if target == Anthropic {
-				target = Chat
-			}
-			n, _, ok := q.nativeCorrection([]catalog.Model{{ID: "a", APIs: []string{string(target)}}})
-			if !ok || n.BaseAPI != string(target) || n.Base(target) != "https://relay.example/gateway/v1" {
-				t.Fatalf("native correction = %+v %v", n, ok)
-			}
-		})
+	q, ok := p.inferredEndpoint(Anthropic)
+	if !ok || q.Chat != p.Chat || q.BaseAPI != p.BaseAPI || q.Anthropic != "https://relay.example/gateway" {
+		t.Fatalf("sibling changed original configuration: %+v", q)
 	}
 }
